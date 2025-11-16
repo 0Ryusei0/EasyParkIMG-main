@@ -5,20 +5,23 @@ import cv2
 import json
 import requests
 import numpy as np
+import torch
 from pathlib import Path
 from ultralytics import YOLO
+from threading import Thread, Lock
+from queue import Queue
 
 # ============== PATH SETUP ==============
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
 # ============== CONFIG ==============
-STREAM_URL = "http://192.168.0.101:4747/video"
+STREAM_URL = "http://192.168.1.11:4747/video"
 MODEL_PATH = r"D:\EasyParkIMG-main\Model\parking_detection2\weights\best.pt"
 SLOT_MAP_JSON = ROOT / "slot_map.json"
 LARAVEL_API = "http://localhost:8000/api/parking-slots/update"
 
-# ROI Polygon (sesuai code sebelumnya)
+# ROI Polygon
 ROI_POLY = np.array([
     [120, 90],
     [520, 80],
@@ -26,8 +29,36 @@ ROI_POLY = np.array([
     [100, 470],
 ], dtype=np.int32)
 
-# Class names dari model YOLO
+# Class names
 CLASS_NAMES = {0: "terisi", 1: "kosong"}
+
+# ============== GPU OPTIMIZATION ==============
+USE_GPU = torch.cuda.is_available()
+DEVICE = 'cuda:0' if USE_GPU else 'cpu'
+print(f"\n{'='*60}")
+print(f"🎮 GPU STATUS")
+print(f"{'='*60}")
+if USE_GPU:
+    print(f"✅ CUDA Available: {torch.cuda.get_device_name(0)}")
+    print(f"   CUDA Version: {torch.version.cuda}")
+    print(f"   Device: {DEVICE}")
+else:
+    print(f"⚠️  GPU not available, using CPU")
+print(f"{'='*60}\n")
+
+# ============== OPTIMIZATIONS ==============
+INFERENCE_SKIP = 2 if USE_GPU else 3  # GPU bisa process lebih sering
+INFERENCE_SIZE = 416  # Keep original size for accuracy with GPU
+USE_FP16 = USE_GPU  # Half precision untuk GPU
+
+# Async API
+api_queue = Queue(maxsize=2)
+api_thread = None
+
+# Shared state
+status_lock = Lock()
+current_slot_status = {}
+current_summary = {"total": 0, "available": 0, "occupied": 0, "unknown": 0}
 
 # ============== CORE FUNCTIONS ==============
 
@@ -71,22 +102,11 @@ def map_detection_to_slot(detection_box, slot_zones, min_iou=0.25):
 
 def process_detections(yolo_results, slot_zones, class_names, 
                       conf_thresh=0.5, min_area=400, min_iou=0.25):
-    """
-    Process YOLO detections dan build slot status
-    
-    Returns:
-        dict: {
-            "slots": {"A1": "kosong", "A2": "terisi", ...},
-            "details": {...},
-            "summary": {...}
-        }
-    """
-    # Initialize
+    """Process YOLO detections dan build slot status"""
     slot_status = {slot_id: "unknown" for slot_id in slot_zones.keys()}
     slot_details = {}
     slot_best_conf = {slot_id: 0.0 for slot_id in slot_zones.keys()}
 
-    # Check if results have boxes
     if not hasattr(yolo_results, 'boxes') or len(yolo_results.boxes) == 0:
         summary = {
             "total": len(slot_zones),
@@ -96,13 +116,10 @@ def process_detections(yolo_results, slot_zones, class_names,
         }
         return {"slots": slot_status, "details": slot_details, "summary": summary}
 
-    # Process each detection
     for box in yolo_results.boxes:
-        # xyxy may be a tensor with shape (1,4) depending on ultralytics version
         try:
             xyxy = box.xyxy[0].cpu().numpy()
         except Exception:
-            # fallback if structure differs
             xyxy = box.xyxy.cpu().numpy().reshape(-1)
         x1, y1, x2, y2 = [float(v) for v in xyxy]
         try:
@@ -114,23 +131,19 @@ def process_detections(yolo_results, slot_zones, class_names,
         except Exception:
             conf = float(box.conf)
 
-        # Filter: confidence
         if conf < conf_thresh:
             continue
 
-        # Filter: minimum area
         area = (x2 - x1) * (y2 - y1)
         if area < min_area:
             continue
 
-        # Map to slot
         det_box = (int(x1), int(y1), int(x2), int(y2))
         slot_id, iou = map_detection_to_slot(det_box, slot_zones, min_iou=min_iou)
 
         if slot_id is None:
             continue
 
-        # Keep highest confidence per slot
         if conf > slot_best_conf[slot_id]:
             status = class_names.get(class_id, "unknown")
             slot_status[slot_id] = status
@@ -142,7 +155,6 @@ def process_detections(yolo_results, slot_zones, class_names,
                 "box": det_box
             }
 
-    # Summary
     available = sum(1 for s in slot_status.values() if s == "kosong")
     occupied = sum(1 for s in slot_status.values() if s == "terisi")
     unknown = sum(1 for s in slot_status.values() if s == "unknown")
@@ -190,10 +202,8 @@ def draw_slot_zones(frame, slot_zones, slot_status, roi_offset=(0, 0)):
         else:
             color = (128, 128, 128)  # Abu-abu
         
-        # Draw rectangle
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         
-        # Label
         label = f"{slot_id}: {status}"
         cv2.putText(frame, label, (x1 + 5, y1 + 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
@@ -201,56 +211,49 @@ def draw_slot_zones(frame, slot_zones, slot_status, roi_offset=(0, 0)):
     return frame
 
 
-def send_to_laravel(slot_status):
-    """
-    Kirim status slot ke Laravel API + DEBUG
+def api_worker():
+    """Background thread untuk kirim API - NON-BLOCKING"""
+    global api_queue
     
-    Args:
-        slot_status: dict {"A1": "kosong", "A2": "terisi", ...}
-    
-    Returns:
-        tuple: (status_code, response_text)
-    """
-    payload = {"slots": slot_status}
-    headers = {
-        "Content-Type": "application/json",
-        # "Authorization": "Bearer YOUR_TOKEN"  # Uncomment jika pakai auth
-    }
-
-    # Debug print
-    print("\n===== DEBUG LARAVEL API REQUEST =====")
-    print("URL:", LARAVEL_API)
-    try:
-        print("Payload:", json.dumps(payload, indent=2, ensure_ascii=False))
-    except Exception:
-        print("Payload (raw):", payload)
-    print("=====================================")
-
-    try:
-        response = requests.post(
-            LARAVEL_API,
-            json=payload,
-            headers=headers,
-            timeout=5.0
-        )
-
-        # Debug response
-        print("----- RESPONSE -----")
-        print("Status Code:", response.status_code)
+    while True:
         try:
-            # Try to pretty print JSON body if possible
-            parsed = response.json()
-            print("Body (json):", json.dumps(parsed, indent=2, ensure_ascii=False))
+            slot_status = api_queue.get(timeout=1)
+            
+            if slot_status is None:  # Poison pill
+                break
+            
+            payload = {"slots": slot_status}
+            headers = {"Content-Type": "application/json"}
+            
+            try:
+                response = requests.post(
+                    LARAVEL_API,
+                    json=payload,
+                    headers=headers,
+                    timeout=3.0
+                )
+                
+                if response.status_code == 200:
+                    print(f"✅ API sent (200) at {time.strftime('%H:%M:%S')}")
+                else:
+                    print(f"⚠ API response: {response.status_code}")
+                    
+            except requests.exceptions.RequestException as e:
+                print(f"❌ API error: {e}")
+            
+            api_queue.task_done()
+            
         except Exception:
-            print("Body (text):", response.text)
-        print("--------------------")
+            continue
 
-        return response.status_code, response.text
-    except requests.exceptions.RequestException as e:
-        print("❌ ERROR saat kirim ke API Laravel:")
-        print("Error:", str(e))
-        print("====================\n")
-        return None, str(e)
+
+def send_to_laravel_async(slot_status):
+    """Queue API request (non-blocking)"""
+    try:
+        if not api_queue.full():
+            api_queue.put_nowait(slot_status.copy())
+    except Exception:
+        pass
 
 
 def load_slot_map(path):
@@ -281,6 +284,9 @@ def calibrate_slots_interactive(video_source, roi_poly, save_path):
         cap.release()
         return
 
+    # Resize to match detection resolution
+    frame = cv2.resize(frame, (640, 480))
+    
     # Crop ROI
     crop, (ox, oy) = crop_by_roi(frame, roi_poly)
     cv2.imwrite("calibration_crop.jpg", crop)
@@ -292,7 +298,7 @@ def calibrate_slots_interactive(video_source, roi_poly, save_path):
     print(f"   Ukuran crop: {crop.shape[1]}x{crop.shape[0]} (w x h)\n")
     print("Instruksi:")
     print("  1. Klik kiri-atas slot → klik kanan-bawah slot")
-    print("  2. Ulangi untuk semua 10 slot (A1-A5, B1-B5)")
+    print("  2. Ulangi untuk semua slot (A1-A6, B1-B6)")
     print("  3. Press 's' untuk save")
     print("  4. Press 'q' untuk selesai")
     print("="*60 + "\n")
@@ -326,12 +332,10 @@ def calibrate_slots_interactive(video_source, roi_poly, save_path):
                         "h": h_slot
                     }
                     
-                    # Draw rectangle
                     cv2.rectangle(crop, (x_slot, y_slot),
                                 (x_slot + w_slot, y_slot + h_slot),
                                 (0, 255, 255), 2)
                     
-                    # Label
                     cv2.putText(crop, slot_id, (x_slot + 5, y_slot + 20),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                     
@@ -339,7 +343,7 @@ def calibrate_slots_interactive(video_source, roi_poly, save_path):
                     current_idx += 1
                     
                     if current_idx >= len(slot_names):
-                        print("\n🎉 Semua 10 slot sudah dikalibrasi!")
+                        print("\n🎉 Semua slot sudah dikalibrasi!")
                         print("   Press 's' untuk save atau 'q' untuk quit")
                 
                 points = []
@@ -363,7 +367,6 @@ def calibrate_slots_interactive(video_source, roi_poly, save_path):
     cv2.destroyAllWindows()
     cap.release()
 
-    # Final save
     if slots:
         with open(save_path, 'w', encoding='utf-8') as f:
             json.dump(slots, f, indent=2, ensure_ascii=False)
@@ -373,8 +376,10 @@ def calibrate_slots_interactive(video_source, roi_poly, save_path):
 # ============== MAIN ==============
 
 def main():
+    global api_thread, current_slot_status, current_summary
+    
     print("\n" + "="*60)
-    print("🚗 PARKING SLOT MAPPING SYSTEM")
+    print("🚗 GPU-ACCELERATED PARKING DETECTION SYSTEM")
     print("="*60)
     
     # Check if slot_map.json exists
@@ -403,18 +408,43 @@ def main():
 
     print(f"✅ Loaded {len(slot_zones)} slots: {list(slot_zones.keys())}\n")
     
-    # Load model
+    # Load model with GPU
     print("🔥 Loading YOLO model...")
     try:
         model = YOLO(MODEL_PATH)
+        model.to(DEVICE)
+        
+        # Warm up GPU
+        if USE_GPU:
+            print("🔥 Warming up GPU...")
+            dummy = np.zeros((INFERENCE_SIZE, INFERENCE_SIZE, 3), dtype=np.uint8)
+            for _ in range(3):  # Multiple warm-up runs
+                _ = model.predict(
+                    dummy, 
+                    verbose=False, 
+                    imgsz=INFERENCE_SIZE,
+                    half=USE_FP16,
+                    device=DEVICE
+                )
+            print("✅ GPU warmed up!")
+        
     except Exception as e:
         print("❌ Gagal load model YOLO:", e)
         return
     print("✅ Model loaded\n")
     
+    # Start API worker thread
+    api_thread = Thread(target=api_worker, daemon=True)
+    api_thread.start()
+    print("✅ API worker thread started\n")
+    
     # Camera
     print(f"📸 Connecting to: {STREAM_URL}")
     cap = cv2.VideoCapture(STREAM_URL)
+    
+    # Camera optimizations
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    
     time.sleep(1.0)
     
     if not cap.isOpened():
@@ -423,99 +453,126 @@ def main():
     
     print("✅ Camera connected\n")
     print("="*60)
+    print("⚡ OPTIMIZATIONS:")
+    print(f"   - Device: {DEVICE}")
+    print(f"   - Skip frames: 1/{INFERENCE_SKIP}")
+    print(f"   - Inference size: {INFERENCE_SIZE}x{INFERENCE_SIZE}")
+    print(f"   - FP16 (Half precision): {USE_FP16}")
+    print(f"   - Async API: Enabled")
+    print("="*60)
     print("🎬 Starting detection loop...")
     print("   Press ESC to quit")
     print("="*60 + "\n")
     
     # Main loop
     frame_count = 0
-    send_interval = 2.0  # Kirim ke Laravel setiap 2 detik
+    send_interval = 2.0
     last_send_time = time.time()
+    fps_time = time.time()
+    fps_counter = 0
+    current_fps = 0
+    ox, oy = 0, 0
+    
+    # Initialize status
+    with status_lock:
+        current_slot_status = {slot_id: "unknown" for slot_id in slot_zones.keys()}
+        current_summary = {"total": len(slot_zones), "available": 0, "occupied": 0, "unknown": len(slot_zones)}
     
     while True:
         ret, frame = cap.read()
         if not ret:
-            time.sleep(0.1)
+            time.sleep(0.01)
             continue
         
         frame_count += 1
+        fps_counter += 1
         
-        # Resize to expected resolution
-        try:
-            frame = cv2.resize(frame, (640, 480))
-        except Exception:
-            # fallback if resize fails
-            pass
+        # FPS calculation
+        if time.time() - fps_time >= 1.0:
+            current_fps = fps_counter
+            fps_counter = 0
+            fps_time = time.time()
         
-        # Crop ROI
-        crop, (ox, oy) = crop_by_roi(frame, ROI_POLY)
+        # Resize to expected resolution (SAME AS CALIBRATION)
+        frame = cv2.resize(frame, (640, 480))
         
-        # YOLO inference
-        try:
-            results = model.predict(
-                crop,
-                conf=0.30,
-                iou=0.5,
-                imgsz=416,
-                verbose=False
-            )[0]
-        except Exception as e:
-            print("⚠️ Warning: YOLO inference failed:", e)
-            # set empty results structure to avoid breaking
-            class Dummy:
-                boxes = []
-            results = Dummy()
+        # INFERENCE - Only every N frames
+        if frame_count % INFERENCE_SKIP == 0:
+            # Crop ROI
+            crop, (ox, oy) = crop_by_roi(frame, ROI_POLY)
+            
+            # YOLO inference with GPU
+            try:
+                results = model.predict(
+                    crop,
+                    conf=0.30,
+                    iou=0.5,
+                    imgsz=INFERENCE_SIZE,
+                    verbose=False,
+                    half=USE_FP16,
+                    device=DEVICE
+                )[0]
+                
+                # Process
+                status_data = process_detections(
+                    results,
+                    slot_zones,
+                    CLASS_NAMES,
+                    conf_thresh=0.5,
+                    min_area=400,
+                    min_iou=0.25
+                )
+                
+                # Update shared state
+                with status_lock:
+                    current_slot_status = status_data["slots"]
+                    current_summary = status_data["summary"]
+                
+            except Exception as e:
+                print(f"⚠️ Inference error: {e}")
         
-        # Process detections
-        status_data = process_detections(
-            results,
-            slot_zones,
-            CLASS_NAMES,
-            conf_thresh=0.5,
-            min_area=400,
-            min_iou=0.25
-        )
+        # Get current state (thread-safe)
+        with status_lock:
+            display_status = current_slot_status.copy()
+            display_summary = current_summary.copy()
         
-        slot_status = status_data["slots"]
-        summary = status_data["summary"]
-        
-        # Print summary setiap 30 frame
-        if frame_count % 30 == 0:
-            print(f"\n📊 Frame {frame_count}")
-            print(f"   ✅ Available: {summary['available']}")
-            print(f"   ❌ Occupied: {summary['occupied']}")
-            print(f"   ❓ Unknown: {summary['unknown']}")
-            print(f"   Status: {slot_status}")
-        
-        # Send to Laravel setiap interval (ENABLED - dengan debug)
+        # Send to API (async)
         current_time = time.time()
         if current_time - last_send_time >= send_interval:
-            status_code, response = send_to_laravel(slot_status)
-            # optional: show short success/fail summary
-            if status_code == 200:
-                print(f"✅ Sent to Laravel (200 OK) at {time.strftime('%H:%M:%S')}")
-            elif status_code is None:
-                print(f"❌ Send failed: {response}")
-            else:
-                print(f"⚠  Laravel response: {status_code} - see debug above")
+            send_to_laravel_async(display_status)
             last_send_time = current_time
         
+        # Print summary every 30 frames
+        if frame_count % 30 == 0:
+            print(f"\n📊 Frame {frame_count} | FPS: {current_fps}")
+            print(f"   ✅ Available: {display_summary['available']}")
+            print(f"   ❌ Occupied: {display_summary['occupied']}")
+            print(f"   ❓ Unknown: {display_summary['unknown']}")
+        
         # Visualization
-        vis = draw_slot_zones(frame, slot_zones, slot_status, roi_offset=(ox, oy))
+        vis = draw_slot_zones(frame, slot_zones, display_status, roi_offset=(ox, oy))
         
         # Info overlay
-        cv2.putText(vis, f"Available: {summary['available']}", (10, 30),
+        cv2.putText(vis, f"FPS: {current_fps} | GPU: {USE_GPU}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.putText(vis, f"Available: {display_summary['available']}", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(vis, f"Occupied: {summary['occupied']}", (10, 60),
+        cv2.putText(vis, f"Occupied: {display_summary['occupied']}", (10, 90),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
-        cv2.imshow("Parking Mapping", vis)
+        cv2.imshow("Parking Detection (GPU)", vis)
         
         # Quit on ESC
         if cv2.waitKey(1) & 0xFF == 27:
             break
     
     print("\n🛑 Stopping...")
+    
+    # Stop API thread
+    api_queue.put(None)
+    if api_thread:
+        api_thread.join(timeout=2)
+    
     cap.release()
     cv2.destroyAllWindows()
     print("✅ Done!\n")
