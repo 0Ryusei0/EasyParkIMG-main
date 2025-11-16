@@ -13,10 +13,10 @@ ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
 # ============== CONFIG ==============
-STREAM_URL = "http://192.168.1.11:4747/video"
+STREAM_URL = "http://192.168.0.101:4747/video"
 MODEL_PATH = r"D:\EasyParkIMG-main\Model\parking_detection2\weights\best.pt"
 SLOT_MAP_JSON = ROOT / "slot_map.json"
-LARAVEL_API = "http://localhost:8000/api/parking/update"  # Ganti dengan URL Laravel Anda
+LARAVEL_API = "http://localhost:8000/api/parking-slots/update"
 
 # ROI Polygon (sesuai code sebelumnya)
 ROI_POLY = np.array([
@@ -98,10 +98,21 @@ def process_detections(yolo_results, slot_zones, class_names,
 
     # Process each detection
     for box in yolo_results.boxes:
-        xyxy = box.xyxy[0].cpu().numpy()
+        # xyxy may be a tensor with shape (1,4) depending on ultralytics version
+        try:
+            xyxy = box.xyxy[0].cpu().numpy()
+        except Exception:
+            # fallback if structure differs
+            xyxy = box.xyxy.cpu().numpy().reshape(-1)
         x1, y1, x2, y2 = [float(v) for v in xyxy]
-        class_id = int(box.cls[0])
-        conf = float(box.conf[0])
+        try:
+            class_id = int(box.cls[0])
+        except Exception:
+            class_id = int(box.cls)
+        try:
+            conf = float(box.conf[0])
+        except Exception:
+            conf = float(box.conf)
 
         # Filter: confidence
         if conf < conf_thresh:
@@ -192,7 +203,7 @@ def draw_slot_zones(frame, slot_zones, slot_status, roi_offset=(0, 0)):
 
 def send_to_laravel(slot_status):
     """
-    Kirim status slot ke Laravel API
+    Kirim status slot ke Laravel API + DEBUG
     
     Args:
         slot_status: dict {"A1": "kosong", "A2": "terisi", ...}
@@ -200,22 +211,45 @@ def send_to_laravel(slot_status):
     Returns:
         tuple: (status_code, response_text)
     """
+    payload = {"slots": slot_status}
+    headers = {
+        "Content-Type": "application/json",
+        # "Authorization": "Bearer YOUR_TOKEN"  # Uncomment jika pakai auth
+    }
+
+    # Debug print
+    print("\n===== DEBUG LARAVEL API REQUEST =====")
+    print("URL:", LARAVEL_API)
     try:
-        payload = {"slots": slot_status}
-        headers = {
-            "Content-Type": "application/json",
-            # "Authorization": "Bearer YOUR_TOKEN"  # Uncomment jika pakai auth
-        }
-        
+        print("Payload:", json.dumps(payload, indent=2, ensure_ascii=False))
+    except Exception:
+        print("Payload (raw):", payload)
+    print("=====================================")
+
+    try:
         response = requests.post(
             LARAVEL_API,
             json=payload,
             headers=headers,
-            timeout=2.0
+            timeout=5.0
         )
-        
+
+        # Debug response
+        print("----- RESPONSE -----")
+        print("Status Code:", response.status_code)
+        try:
+            # Try to pretty print JSON body if possible
+            parsed = response.json()
+            print("Body (json):", json.dumps(parsed, indent=2, ensure_ascii=False))
+        except Exception:
+            print("Body (text):", response.text)
+        print("--------------------")
+
         return response.status_code, response.text
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
+        print("❌ ERROR saat kirim ke API Laravel:")
+        print("Error:", str(e))
+        print("====================\n")
         return None, str(e)
 
 
@@ -225,7 +259,7 @@ def load_slot_map(path):
     if not path.exists():
         raise FileNotFoundError(f"❌ Slot map not found: {path}")
     
-    with open(path, 'r') as f:
+    with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 
@@ -319,8 +353,8 @@ def calibrate_slots_interactive(video_source, roi_poly, save_path):
         key = cv2.waitKey(1) & 0xFF
         
         if key == ord('s'):
-            with open(save_path, 'w') as f:
-                json.dump(slots, f, indent=2)
+            with open(save_path, 'w', encoding='utf-8') as f:
+                json.dump(slots, f, indent=2, ensure_ascii=False)
             print(f"\n✅ Slot map saved to: {save_path}")
         
         elif key == ord('q'):
@@ -331,8 +365,8 @@ def calibrate_slots_interactive(video_source, roi_poly, save_path):
 
     # Final save
     if slots:
-        with open(save_path, 'w') as f:
-            json.dump(slots, f, indent=2)
+        with open(save_path, 'w', encoding='utf-8') as f:
+            json.dump(slots, f, indent=2, ensure_ascii=False)
         print(f"\n✅ Final slot map saved to: {save_path}")
 
 
@@ -361,12 +395,21 @@ def main():
     
     # Load slot map
     print(f"📂 Loading slot map: {SLOT_MAP_JSON}")
-    slot_zones = load_slot_map(SLOT_MAP_JSON)
+    try:
+        slot_zones = load_slot_map(SLOT_MAP_JSON)
+    except Exception as e:
+        print("❌ Gagal load slot map:", e)
+        return
+
     print(f"✅ Loaded {len(slot_zones)} slots: {list(slot_zones.keys())}\n")
     
     # Load model
     print("🔥 Loading YOLO model...")
-    model = YOLO(MODEL_PATH)
+    try:
+        model = YOLO(MODEL_PATH)
+    except Exception as e:
+        print("❌ Gagal load model YOLO:", e)
+        return
     print("✅ Model loaded\n")
     
     # Camera
@@ -398,19 +441,30 @@ def main():
         frame_count += 1
         
         # Resize to expected resolution
-        frame = cv2.resize(frame, (640, 480))
+        try:
+            frame = cv2.resize(frame, (640, 480))
+        except Exception:
+            # fallback if resize fails
+            pass
         
         # Crop ROI
         crop, (ox, oy) = crop_by_roi(frame, ROI_POLY)
         
         # YOLO inference
-        results = model.predict(
-            crop,
-            conf=0.30,
-            iou=0.5,
-            imgsz=416,
-            verbose=False
-        )[0]
+        try:
+            results = model.predict(
+                crop,
+                conf=0.30,
+                iou=0.5,
+                imgsz=416,
+                verbose=False
+            )[0]
+        except Exception as e:
+            print("⚠️ Warning: YOLO inference failed:", e)
+            # set empty results structure to avoid breaking
+            class Dummy:
+                boxes = []
+            results = Dummy()
         
         # Process detections
         status_data = process_detections(
@@ -433,15 +487,18 @@ def main():
             print(f"   ❓ Unknown: {summary['unknown']}")
             print(f"   Status: {slot_status}")
         
-        # Send to Laravel setiap interval (DISABLED - untuk testing)
-        # current_time = time.time()
-        # if current_time - last_send_time >= send_interval:
-        #     status_code, response = send_to_laravel(slot_status)
-        #     if status_code == 200:
-        #         print(f"✅ Sent to Laravel: {status_code}")
-        #     else:
-        #         print(f"⚠  Laravel response: {status_code} - {response}")
-        #     last_send_time = current_time
+        # Send to Laravel setiap interval (ENABLED - dengan debug)
+        current_time = time.time()
+        if current_time - last_send_time >= send_interval:
+            status_code, response = send_to_laravel(slot_status)
+            # optional: show short success/fail summary
+            if status_code == 200:
+                print(f"✅ Sent to Laravel (200 OK) at {time.strftime('%H:%M:%S')}")
+            elif status_code is None:
+                print(f"❌ Send failed: {response}")
+            else:
+                print(f"⚠  Laravel response: {status_code} - see debug above")
+            last_send_time = current_time
         
         # Visualization
         vis = draw_slot_zones(frame, slot_zones, slot_status, roi_offset=(ox, oy))
