@@ -1,12 +1,11 @@
 # =====================================================
-# 🚗 Parking Lot Preprocessing (Tanpa ROI)
-#    Ideal untuk labeling terisi/kosong otomatis
+# 🚗 Parking Lot Preprocessing (Tanpa ROI, Tanpa Gaussian)
 # =====================================================
 
 import cv2
 import os
 
-# === Path Dataset (ubah sesuai direktori kamu) ===
+# === Path Dataset ===
 INPUT_DIR = r"D:\Quant_ML_Project\ML.py\EasyPark\Dataset\parking_lot_final\train\images"
 OUTPUT_DIR = os.path.join(os.path.dirname(INPUT_DIR), "images_preprocessed")
 
@@ -29,11 +28,8 @@ def preprocess_image(image_path, save_path):
     # Terapkan CLAHE untuk peningkatan kontras
     enhanced = clahe.apply(gray)
 
-    # Denoise ringan
-    blur = cv2.GaussianBlur(enhanced, (3, 3), 0)
-
-    # Resize ke 640x640 agar seragam untuk YOLO
-    resized = cv2.resize(blur, (640, 640))
+    # *Tanpa Gaussian Blur — langsung Resize*
+    resized = cv2.resize(enhanced, (640, 640))
 
     # Simpan hasilnya
     cv2.imwrite(save_path, resized)
