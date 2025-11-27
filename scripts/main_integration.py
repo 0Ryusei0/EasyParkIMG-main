@@ -86,30 +86,31 @@ def calculate_iou(box1, box2):
     
     return inter / union if union > 0 else 0.0
 
-def process_detections(results, slot_zones, reserved_slots, min_iou=0.25):
+def process_detections(results, slot_zones, reserved_slots, min_iou=0.15):
     """
     Process YOLO results dengan instant override untuk reserved slots
-    RESERVED -> TERISI: Langsung override (mobil datang)
-    RESERVED -> KOSONG: Tetap reserved (tunggu timeout di backend)
+    PERBAIKAN: IoU lebih rendah, priority detection lebih tinggi
     """
     slot_status = {sid: "unknown" for sid in slot_zones.keys()}
     slot_conf = {sid: 0.0 for sid in slot_zones.keys()}
     
-    # Prioritaskan reserved slots dari database
+    # Tandai reserved slots dari database
     for slot_id in reserved_slots.keys():
         if slot_id in slot_status:
             slot_status[slot_id] = "reserved"
-            slot_conf[slot_id] = 1.0  # Max confidence untuk reserved
+            slot_conf[slot_id] = 0.95  # Set tinggi tapi bukan max
     
     if not hasattr(results, 'boxes') or len(results.boxes) == 0:
         return slot_status
     
+    # Proses semua detections
     for box in results.boxes:
         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
         conf = float(box.conf[0])
         cls = int(box.cls[0])
         
-        if conf < 0.5 or (x2-x1)*(y2-y1) < 400:
+        # PERBAIKAN 1: Turunkan threshold confidence dan size
+        if conf < 0.3 or (x2-x1)*(y2-y1) < 200:  # Lebih permisif
             continue
         
         det_box = (int(x1), int(y1), int(x2), int(y2))
@@ -123,21 +124,28 @@ def process_detections(results, slot_zones, reserved_slots, min_iou=0.25):
             if iou > best_iou:
                 best_iou, best_slot = iou, sid
         
-        if best_slot and conf > slot_conf[best_slot]:
+        if best_slot:
             detected_status = CLASS_NAMES.get(cls, "unknown")
             
-            # INSTANT OVERRIDE: Reserved langsung jadi terisi jika mobil datang
-            if slot_status[best_slot] == "reserved":
-                if detected_status == "terisi":
-                    # ✅ Override: reserved -> terisi (INSTANT, no timeout check)
+            # PERBAIKAN 2: PAKSA override untuk detection "terisi" dengan conf tinggi
+            if detected_status == "terisi":
+                # Jika detection confidence > 0.4, PAKSA override apapun statusnya
+                if conf > 0.4:
+                    if slot_status[best_slot] == "reserved":
+                        print(f"🚗 FORCE OVERRIDE: {best_slot} reserved -> terisi (conf={conf:.2f}, iou={best_iou:.2f})")
                     slot_status[best_slot] = "terisi"
                     slot_conf[best_slot] = conf
-                    print(f"🚗 INSTANT OVERRIDE: {best_slot} reserved -> terisi (mobil datang)")
-                # Jika kosong, tetap reserved (backend akan handle timeout)
-            else:
-                # Slot tidak reserved, update normal
-                slot_status[best_slot] = detected_status
-                slot_conf[best_slot] = conf
+                # Jika conf lebih tinggi dari slot_conf saat ini
+                elif conf > slot_conf[best_slot]:
+                    slot_status[best_slot] = "terisi"
+                    slot_conf[best_slot] = conf
+            
+            # Untuk detection "kosong", hanya update jika bukan reserved atau conf sangat tinggi
+            elif detected_status == "kosong":
+                if slot_status[best_slot] != "reserved" or conf > 0.8:
+                    if conf > slot_conf[best_slot]:
+                        slot_status[best_slot] = detected_status
+                        slot_conf[best_slot] = conf
     
     return slot_status
 
