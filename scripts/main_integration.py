@@ -7,12 +7,14 @@ from ultralytics import YOLO
 from threading import Thread
 from queue import Queue
 import time
+from datetime import datetime
 
 # ============== CONFIG ==============
-STREAM_URL = "http://192.168.1.11:4747/video"
+STREAM_URL = "http://192.168.1.12:4747/video"
 MODEL_PATH = r"D:\EasyParkIMG-main\Model\parking_detection2\weights\best.pt"
 SLOT_MAP_JSON = Path(__file__).parent / "slot_map.json"
 LARAVEL_API = "http://localhost:8000/api/parking-slots/update"
+LARAVEL_GET_API = "http://localhost:8000/api/parking-slots"
 
 # ROI Polygon
 ROI_POLY = np.array([[120, 90], [520, 80], [560, 460], [100, 470]], dtype=np.int32)
@@ -27,7 +29,45 @@ SLOT_NAMES = ["A1", "A2", "A3", "A4", "A5", "A6",
 # Queue untuk async API
 api_queue = Queue(maxsize=2)
 
+# Cache untuk reserved slots
+reserved_slots_cache = {}
+
 # ============== FUNCTIONS ==============
+
+def fetch_reserved_slots():
+    """Ambil daftar slot yang reserved dari database"""
+    global reserved_slots_cache
+    try:
+        response = requests.get(LARAVEL_GET_API, timeout=10.0)
+        if response.status_code == 200:
+            slots_data = response.json()
+            reserved = {}
+            
+            for slot in slots_data:
+                if slot.get('status') == 'reserved':
+                    slot_code = slot.get('slot_code')
+                    if slot_code:
+                        reserved[slot_code] = {
+                            'status': 'reserved',
+                            'last_update': slot.get('last_update')
+                        }
+            
+            reserved_slots_cache = reserved
+            if reserved:
+                print(f"🔒 RESERVED SLOTS: {list(reserved.keys())} | {time.strftime('%H:%M:%S')}")
+            else:
+                print(f"✅ No reserved slots | {time.strftime('%H:%M:%S')}")
+            
+            return reserved
+    except requests.exceptions.Timeout:
+        print(f"⚠️  Reserve check timeout - using cache | {time.strftime('%H:%M:%S')}")
+    except requests.exceptions.ConnectionError:
+        print(f"⚠️  Cannot connect to API for reserve check | {time.strftime('%H:%M:%S')}")
+    except Exception as e:
+        print(f"⚠️  Reserve check error: {str(e)[:50]} | {time.strftime('%H:%M:%S')}")
+    
+    # Return cached data jika API gagal
+    return reserved_slots_cache
 
 def calculate_iou(box1, box2):
     """Calculate IoU between two boxes"""
@@ -46,10 +86,20 @@ def calculate_iou(box1, box2):
     
     return inter / union if union > 0 else 0.0
 
-def process_detections(results, slot_zones, min_iou=0.25):
-    """Process YOLO results and map to slots"""
+def process_detections(results, slot_zones, reserved_slots, min_iou=0.25):
+    """
+    Process YOLO results dengan instant override untuk reserved slots
+    RESERVED -> TERISI: Langsung override (mobil datang)
+    RESERVED -> KOSONG: Tetap reserved (tunggu timeout di backend)
+    """
     slot_status = {sid: "unknown" for sid in slot_zones.keys()}
     slot_conf = {sid: 0.0 for sid in slot_zones.keys()}
+    
+    # Prioritaskan reserved slots dari database
+    for slot_id in reserved_slots.keys():
+        if slot_id in slot_status:
+            slot_status[slot_id] = "reserved"
+            slot_conf[slot_id] = 1.0  # Max confidence untuk reserved
     
     if not hasattr(results, 'boxes') or len(results.boxes) == 0:
         return slot_status
@@ -74,8 +124,20 @@ def process_detections(results, slot_zones, min_iou=0.25):
                 best_iou, best_slot = iou, sid
         
         if best_slot and conf > slot_conf[best_slot]:
-            slot_status[best_slot] = CLASS_NAMES.get(cls, "unknown")
-            slot_conf[best_slot] = conf
+            detected_status = CLASS_NAMES.get(cls, "unknown")
+            
+            # INSTANT OVERRIDE: Reserved langsung jadi terisi jika mobil datang
+            if slot_status[best_slot] == "reserved":
+                if detected_status == "terisi":
+                    # ✅ Override: reserved -> terisi (INSTANT, no timeout check)
+                    slot_status[best_slot] = "terisi"
+                    slot_conf[best_slot] = conf
+                    print(f"🚗 INSTANT OVERRIDE: {best_slot} reserved -> terisi (mobil datang)")
+                # Jika kosong, tetap reserved (backend akan handle timeout)
+            else:
+                # Slot tidak reserved, update normal
+                slot_status[best_slot] = detected_status
+                slot_conf[best_slot] = conf
     
     return slot_status
 
@@ -88,38 +150,92 @@ def crop_roi(frame, poly):
     return crop, (x, y)
 
 def draw_slots(frame, slot_zones, slot_status, offset=(0,0)):
-    """Draw slot zones with status colors"""
+    """Draw slot zones - KUNING untuk reserved dengan label 'DIPESAN'"""
     ox, oy = offset
-    colors = {"kosong": (0, 255, 0), "terisi": (0, 0, 255), "unknown": (128, 128, 128)}
+    
+    # Warna untuk setiap status
+    colors = {
+        "kosong": (0, 255, 0),       # Hijau
+        "terisi": (0, 0, 255),       # Merah
+        "reserved": (0, 255, 255),   # KUNING (Yellow dalam BGR)
+        "unknown": (128, 128, 128)   # Abu-abu
+    }
+    
+    # Label untuk ditampilkan
+    labels = {
+        "kosong": "kosong",
+        "terisi": "terisi",
+        "reserved": "DIPESAN",
+        "unknown": "unknown"
+    }
     
     for sid, zone in slot_zones.items():
         x1, y1 = int(zone["x"] + ox), int(zone["y"] + oy)
         x2, y2 = x1 + zone["w"], y1 + zone["h"]
         status = slot_status.get(sid, "unknown")
         color = colors.get(status, (128, 128, 128))
+        label = labels.get(status, status)
         
+        # Gambar kotak slot
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, f"{sid}: {status}", (x1+5, y1+18),
+        
+        # Label slot + status
+        cv2.putText(frame, f"{sid}: {label}", (x1+5, y1+18),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    
     return frame
 
 def api_worker():
     """Background thread untuk kirim API"""
+    consecutive_errors = 0
+    success_count = 0
     while True:
         try:
             data = api_queue.get(timeout=1)
+            
+            # Exit signal
             if data is None:
+                print(f"\n📊 API Stats: {success_count} successful updates sent")
+                api_queue.task_done()
                 break
             
-            response = requests.post(LARAVEL_API, json={"slots": data}, 
-                                   headers={"Content-Type": "application/json"}, 
-                                   timeout=3.0)
+            # Hitung statistik
+            kosong = sum(1 for v in data.values() if v == "kosong")
+            terisi = sum(1 for v in data.values() if v == "terisi")
+            reserved = sum(1 for v in data.values() if v == "reserved")
             
-            if response.status_code == 200:
-                print(f"✅ API sent at {time.strftime('%H:%M:%S')}")
+            try:
+                response = requests.post(LARAVEL_API, json={"slots": data}, 
+                                       headers={"Content-Type": "application/json"}, 
+                                       timeout=10.0)
+                
+                if response.status_code == 200:
+                    success_count += 1
+                    print(f"✅ API UPDATE #{success_count} | {time.strftime('%H:%M:%S')} | Kosong:{kosong} Terisi:{terisi} Dipesan:{reserved}")
+                    consecutive_errors = 0
+                else:
+                    print(f"⚠️  API returned status {response.status_code}")
+                    
+            except requests.exceptions.Timeout:
+                consecutive_errors += 1
+                if consecutive_errors <= 3:
+                    print(f"❌ API TIMEOUT ({consecutive_errors}/3) | {time.strftime('%H:%M:%S')}")
+                    
+            except requests.exceptions.ConnectionError:
+                consecutive_errors += 1
+                if consecutive_errors == 1:
+                    print(f"❌ CANNOT CONNECT TO LARAVEL | Check: php artisan serve | {time.strftime('%H:%M:%S')}")
+                    
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors <= 2:
+                    print(f"❌ API ERROR: {str(e)[:80]} | {time.strftime('%H:%M:%S')}")
             
+            # Always call task_done after processing
             api_queue.task_done()
+            
         except:
+            # Timeout on queue.get() - no task to mark done
             continue
 
 def send_api_async(slot_status):
@@ -284,8 +400,9 @@ def calibrate_slots():
 # ============== DETECTION ==============
 
 def run_detection():
-    """Main detection loop"""
-    print("\n🚗 PARKING DETECTION SYSTEM (CPU)")
+    """Main detection loop dengan INSTANT OVERRIDE untuk reserved slots"""
+    print("\n🚗 PARKING DETECTION SYSTEM (INSTANT OVERRIDE MODE)")
+    print("="*60)
     
     # Load slot map
     if not SLOT_MAP_JSON.exists():
@@ -313,13 +430,31 @@ def run_detection():
         print("❌ Cannot open camera")
         return
     
-    print("✅ Camera connected\nPress ESC to quit\n")
+    print("✅ Camera connected")
+    print("\n📋 LEGEND:")
+    print("   🟢 HIJAU   = Kosong (available)")
+    print("   🔴 MERAH   = Terisi (occupied)")
+    print("   🟡 KUNING  = DIPESAN (reserved - auto expire 3 menit)")
+    print("   ⚪ ABU-ABU = Unknown")
+    print("\n🔧 SETTINGS:")
+    print(f"   API Update: Every 3 seconds")
+    print(f"   Reserve Check: Every 10 seconds")
+    print(f"   Detection FPS: ~10 fps (every 3 frames)")
+    print(f"   ⚡ INSTANT OVERRIDE: Reserved -> Terisi (NO TIMEOUT)")
+    print("\nPress ESC to quit\n")
+    print("="*60 + "\n")
     
     # Main loop
     frame_count = 0
     last_api_time = time.time()
+    last_reserve_check = time.time()
+    last_stats_print = time.time()
     slot_status = {sid: "unknown" for sid in slot_zones.keys()}
     ox, oy = 0, 0
+    
+    # Fetch reserved slots saat start
+    print("🔍 Checking for reserved slots...")
+    fetch_reserved_slots()
     
     while True:
         ret, frame = cap.read()
@@ -329,29 +464,40 @@ def run_detection():
         frame_count += 1
         frame = cv2.resize(frame, (640, 480))
         
+        # Cek reserved slots dari database setiap 10 detik
+        if time.time() - last_reserve_check >= 10.0:
+            fetch_reserved_slots()
+            last_reserve_check = time.time()
+        
         # Inference every 3 frames
         if frame_count % 3 == 0:
             crop, (ox, oy) = crop_roi(frame, ROI_POLY)
             results = model.predict(crop, conf=0.3, iou=0.5, imgsz=416, verbose=False)[0]
-            slot_status = process_detections(results, slot_zones)
+            slot_status = process_detections(results, slot_zones, reserved_slots_cache)
         
-        # Send API every 2 seconds
-        if time.time() - last_api_time >= 2.0:
+        # Send API every 3 seconds
+        if time.time() - last_api_time >= 3.0:
             send_api_async(slot_status)
             last_api_time = time.time()
         
-        # Display
+        # Display statistics (setiap 5 detik)
         available = sum(1 for s in slot_status.values() if s == "kosong")
         occupied = sum(1 for s in slot_status.values() if s == "terisi")
+        reserved = sum(1 for s in slot_status.values() if s == "reserved")
         
-        if frame_count % 30 == 0:
-            print(f"Frame {frame_count} | Available: {available} | Occupied: {occupied}")
+        if time.time() - last_stats_print >= 5.0:
+            print(f"📊 Frame {frame_count:5d} | 🟢 Kosong: {available:2d} | 🔴 Terisi: {occupied:2d} | 🟡 Dipesan: {reserved:2d}")
+            last_stats_print = time.time()
         
+        # Draw visualization
         vis = draw_slots(frame, slot_zones, slot_status, (ox, oy))
-        cv2.putText(vis, f"Available: {available} | Occupied: {occupied}", 
-                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         
-        cv2.imshow("Parking Detection", vis)
+        # Info header
+        info_text = f"Kosong: {available} | Terisi: {occupied} | Dipesan: {reserved}"
+        cv2.putText(vis, info_text, (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        
+        cv2.imshow("Parking Detection - INSTANT OVERRIDE MODE", vis)
         
         if cv2.waitKey(1) & 0xFF == 27:
             break
@@ -360,7 +506,7 @@ def run_detection():
     api_queue.put(None)
     cap.release()
     cv2.destroyAllWindows()
-    print("✅ Done!")
+    print("\n✅ Detection stopped!")
 
 # ============== MAIN ==============
 
@@ -390,7 +536,7 @@ def main():
     else:
         print("\nSlot map ditemukan!")
         print("Pilih mode:")
-        print("  1. Run detection")
+        print("  1. Run detection (INSTANT OVERRIDE MODE)")
         print("  2. Re-kalibrasi slot")
         print("  3. Keluar")
         
